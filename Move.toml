@@ -1,0 +1,16 @@
+[package]
+name = "publish3"
+version = "1.0.0"
+authors = []
+
+[addresses]
+publish3 = "0x2e3630c6be9caf3e65c7e542ea6e297cf56972b31d7e948eaa2da3351463df4e"
+
+[dev-addresses]
+
+[dependencies.AptosFramework]
+git = "https://github.com/movementlabsxyz/aptos-core.git"
+rev = "movement"
+subdir = "aptos-move/framework/aptos-framework"
+
+[dev-dependencies]
