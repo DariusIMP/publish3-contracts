@@ -18,12 +18,15 @@ module publish3::publication_registry {
     const E_INVALID_RECIPIENT: u64 = 5;
 
     /*********************************
-     * Server authority
+     * Platform fee (basis points)
+     *********************************/
+    const PLATFORM_FEE_BPS: u64 = 1000; // 10%
+
+    /*********************************
+     * Publish 3 authority
      *********************************/
 
-    /// Holds the backend public key.
-    /// This is the root of trust for publication authorization.
-    struct ServerAuthority has key {
+    struct P3Authority has key {
         pubkey: ed25519::UnvalidatedPublicKey
     }
 
@@ -41,8 +44,6 @@ module publish3::publication_registry {
         id: u64,
         authors: vector<address>,
         price: u64,
-        citation_royalty_bps: u64,
-        cited_papers: vector<u64>,
         content_hash: vector<u8>,
         published_at: u64
     }
@@ -60,7 +61,6 @@ module publish3::publication_registry {
     struct PublishCapability has key, drop {
         paper_hash: vector<u8>,
         price: u64,
-        citation_royalty_bps: u64,
         expires_at: u64
     }
 
@@ -68,7 +68,6 @@ module publish3::publication_registry {
     struct MintPayload has drop {
         paper_hash: vector<u8>,
         price: u64,
-        citation_royalty_bps: u64,
         recipient: address,
         expires_at: u64
     }
@@ -91,6 +90,23 @@ module publish3::publication_registry {
         amount: u64
     }
 
+    #[event]
+    struct RoyaltyDistributed has drop, store {
+        paper_id: u64,
+        buyer: address,
+        amount: u64,
+        platform_fee: u64,
+        author_share: u64,
+        per_author_amount: u64
+    }
+
+    #[event]
+    struct X402PaymentEvent has drop, store {
+        recipient: address,
+        amount: u64,
+        paper_id: u64
+    }
+
     /*********************************
      * Initialization
      *********************************/
@@ -107,7 +123,7 @@ module publish3::publication_registry {
 
         move_to(
             admin,
-            ServerAuthority { pubkey: ed25519::new_unvalidated_public_key_from_bytes(server_pubkey) }
+            P3Authority { pubkey: ed25519::new_unvalidated_public_key_from_bytes(server_pubkey) }
         );
 
         move_to(
@@ -129,18 +145,16 @@ module publish3::publication_registry {
         user: &signer,
         paper_hash: vector<u8>,
         price: u64,
-        citation_royalty_bps: u64,
         recipient: address,
         expires_at: u64,
         server_signature: vector<u8>
-    ) acquires ServerAuthority {
+    ) acquires P3Authority {
 
-        let authority = borrow_global<ServerAuthority>(@publish3);
+        let authority = borrow_global<P3Authority>(@publish3);
 
         let payload = MintPayload {
             paper_hash: paper_hash,
             price: price,
-            citation_royalty_bps: citation_royalty_bps,
             recipient: recipient,
             expires_at: expires_at
         };
@@ -176,7 +190,6 @@ module publish3::publication_registry {
             PublishCapability {
                 paper_hash: payload.paper_hash,
                 price: payload.price,
-                citation_royalty_bps: payload.citation_royalty_bps,
                 expires_at: payload.expires_at
             }
         );
@@ -188,11 +201,10 @@ module publish3::publication_registry {
 
     public entry fun publish(
         _author: &signer,
-        authors: vector<address>,
-        cited_papers: vector<u64>
+        authors: vector<address>
     ) acquires Registry, PaperCounter, PublishCapability {
 
-        let PublishCapability { paper_hash, price, citation_royalty_bps, expires_at } = move_from<PublishCapability>(signer::address_of(_author));
+        let PublishCapability { paper_hash, price, expires_at } = move_from<PublishCapability>(signer::address_of(_author));
 
         assert!(price > 0, E_INVALID_PRICE);
 
@@ -208,9 +220,7 @@ module publish3::publication_registry {
         let paper = Paper {
             id: counter.next_id,
             authors,
-            price: price,
-            citation_royalty_bps: citation_royalty_bps,
-            cited_papers,
+            price,
             content_hash: paper_hash,
             published_at: timestamp::now_seconds()
         };
@@ -223,7 +233,7 @@ module publish3::publication_registry {
             price: price
         });
 
-        counter.next_id = counter.next_id + 1;
+        counter.next_id += 1;
     }
 
     /*********************************
@@ -241,8 +251,61 @@ module publish3::publication_registry {
 
         assert!(amount >= paper_ref.price, E_INVALID_PRICE);
 
-        // Payment settlement happens via x402 rails off-chain.
-        // This event is the canonical on-chain receipt.
+        // Calculate royalty distribution
+        // Platform fee: 10% of purchase amount
+        let platform_fee = (amount * PLATFORM_FEE_BPS) / 10000;
+        
+        // Author share: 90% of purchase amount  
+        let author_share = amount - platform_fee;
+        
+        // Calculate per-author amount (equal split)
+        let author_count = vector::length(&paper_ref.authors);
+        let per_author_amount = if (author_count > 0) {
+            author_share / author_count
+        } else {
+            0
+        };
+        
+        // Handle remainder from division (give to platform)
+        let remainder = if (author_count > 0) {
+            author_share - (per_author_amount * author_count)
+        } else {
+            author_share
+        };
+        
+        let total_platform_fee = platform_fee + remainder;
+
+        // Emit royalty distribution event
+        event::emit(RoyaltyDistributed {
+            paper_id,
+            buyer: signer::address_of(buyer),
+            amount,
+            platform_fee: total_platform_fee,
+            author_share: author_share - remainder, // actual distributed to authors
+            per_author_amount
+        });
+
+        // Emit x402 payment events (placeholders for actual x402 integration)
+        // Platform payment
+        event::emit(X402PaymentEvent {
+            recipient: @publish3, // Platform address
+            amount: total_platform_fee,
+            paper_id
+        });
+
+        // Author payments
+        let i = 0;
+        while (i < author_count) {
+            let author_address = *vector::borrow(&paper_ref.authors, i);
+            event::emit(X402PaymentEvent {
+                recipient: author_address,
+                amount: per_author_amount,
+                paper_id
+            });
+            i = i + 1;
+        };
+
+        // Also emit the original purchase event for compatibility
         event::emit(PaperPurchased {
             paper_id,
             buyer: signer::address_of(buyer),
