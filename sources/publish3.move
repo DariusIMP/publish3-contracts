@@ -5,9 +5,13 @@ module publish3::publication_registry {
     use std::event;
     use std::timestamp;
     use std::hash;
-    use std::ed25519;
     use std::bcs;
-    
+    use std::ed25519;
+
+    use aptos_framework::coin;
+    use aptos_framework::aptos_coin::AptosCoin;
+    use aptos_framework::table::{Self, Table};
+
     /*********************************
      * Error codes
      *********************************/
@@ -16,6 +20,8 @@ module publish3::publication_registry {
     const E_NOT_AUTHORIZED: u64 = 3;
     const E_EXPIRED: u64 = 4;
     const E_INVALID_RECIPIENT: u64 = 5;
+    const E_ALREADY_PUBLISHED: u64 = 6;
+    const E_NOT_FOUND: u64 = 7;
 
     /*********************************
      * Platform fee (basis points)
@@ -23,49 +29,42 @@ module publish3::publication_registry {
     const PLATFORM_FEE_BPS: u64 = 1000; // 10%
 
     /*********************************
-     * Publish 3 authority
+     * Publish3 authority
      *********************************/
-
     struct P3Authority has key {
         pubkey: ed25519::UnvalidatedPublicKey
     }
 
     /*********************************
-     * Core registry state
+     * Core registry
      *********************************/
 
-    /// Global counter for paper IDs
-    struct PaperCounter has key {
-        next_id: u64
+    /// paper_uid_hash → Paper
+    struct Registry has key {
+        papers: Table<vector<u8>, Paper>
     }
 
-    /// Paper metadata (on-chain reference, not the content)
     struct Paper has store {
-        id: u64,
+        paper_uid_hash: vector<u8>,
         authors: vector<address>,
         price: u64,
         content_hash: vector<u8>,
         published_at: u64
     }
 
-    /// Global registry (stored once under @publish3)
-    struct Registry has key {
-        papers: vector<Paper>
-    }
-
     /*********************************
      * Capability-based publishing
      *********************************/
 
-    /// Ephemeral capability that allows a single publish
     struct PublishCapability has key, drop {
+        paper_uid_hash: vector<u8>,
         paper_hash: vector<u8>,
         price: u64,
         expires_at: u64
     }
 
-    /// Payload signed by the backend
     struct MintPayload has drop {
+        paper_uid_hash: vector<u8>,
         paper_hash: vector<u8>,
         price: u64,
         recipient: address,
@@ -78,21 +77,21 @@ module publish3::publication_registry {
 
     #[event]
     struct PaperPublished has drop, store {
-        paper_id: u64,
+        paper_uid_hash: vector<u8>,
         authors: vector<address>,
         price: u64
     }
 
     #[event]
     struct PaperPurchased has drop, store {
-        paper_id: u64,
+        paper_uid_hash: vector<u8>,
         buyer: address,
         amount: u64
     }
 
     #[event]
     struct RoyaltyDistributed has drop, store {
-        paper_id: u64,
+        paper_uid_hash: vector<u8>,
         buyer: address,
         amount: u64,
         platform_fee: u64,
@@ -100,49 +99,40 @@ module publish3::publication_registry {
         per_author_amount: u64
     }
 
-    #[event]
-    struct X402PaymentEvent has drop, store {
-        recipient: address,
-        amount: u64,
-        paper_id: u64
-    }
-
     /*********************************
      * Initialization
      *********************************/
 
-    /// Called once at deployment time
     public entry fun initialize(
         admin: &signer,
         server_pubkey: vector<u8>
     ) {
-        assert!(
-            !exists<Registry>(@publish3),
-            E_ALREADY_INITIALIZED
+        assert!(!exists<Registry>(@publish3), E_ALREADY_INITIALIZED);
+
+        move_to(
+            admin,
+            P3Authority {
+                pubkey: ed25519::new_unvalidated_public_key_from_bytes(server_pubkey)
+            }
         );
 
         move_to(
             admin,
-            P3Authority { pubkey: ed25519::new_unvalidated_public_key_from_bytes(server_pubkey) }
+            Registry {
+                papers: table::new<vector<u8>, Paper>()
+            }
         );
 
-        move_to(
-            admin,
-            Registry { papers: vector::empty() }
-        );
-
-        move_to(
-            admin,
-            PaperCounter { next_id: 0 }
-        );
+        coin::register<AptosCoin>(admin);
     }
 
     /*********************************
-     * Authorization: mint capability
+     * Mint publish capability
      *********************************/
 
     public entry fun mint_publish_capability_with_sig(
         user: &signer,
+        paper_uid_hash: vector<u8>,
         paper_hash: vector<u8>,
         price: u64,
         recipient: address,
@@ -153,41 +143,35 @@ module publish3::publication_registry {
         let authority = borrow_global<P3Authority>(@publish3);
 
         let payload = MintPayload {
-            paper_hash: paper_hash,
-            price: price,
-            recipient: recipient,
-            expires_at: expires_at
+            paper_uid_hash,
+            paper_hash,
+            price,
+            recipient,
+            expires_at
         };
 
-        // Verify backend signature
-        let payload_hash = hash_payload(&payload);
-
+        let payload_hash = hash::sha3_256(bcs::to_bytes(&payload));
         let sig = ed25519::new_signature_from_bytes(server_signature);
 
         assert!(
-            ed25519::signature_verify_strict(
-                &sig,
-                &authority.pubkey,
-                payload_hash
-            ),
+            ed25519::signature_verify_strict(&sig, &authority.pubkey, payload_hash),
             E_NOT_AUTHORIZED
         );
 
-        // Ensure the capability is minted for the caller
         assert!(
-            payload.recipient == signer::address_of(user),
+            recipient == signer::address_of(user),
             E_INVALID_RECIPIENT
         );
 
-        // Ensure authorization is still valid
         assert!(
-            timestamp::now_seconds() <= payload.expires_at,
+            timestamp::now_seconds() <= expires_at,
             E_EXPIRED
         );
 
         move_to(
             user,
             PublishCapability {
+                paper_uid_hash: payload.paper_uid_hash,
                 paper_hash: payload.paper_hash,
                 price: payload.price,
                 expires_at: payload.expires_at
@@ -196,130 +180,106 @@ module publish3::publication_registry {
     }
 
     /*********************************
-     * Publish paper (consumes capability)
+     * Publish paper
      *********************************/
 
     public entry fun publish(
-        _author: &signer,
+        author: &signer,
         authors: vector<address>
-    ) acquires Registry, PaperCounter, PublishCapability {
+    ) acquires Registry, PublishCapability {
 
-        let PublishCapability { paper_hash, price, expires_at } = move_from<PublishCapability>(signer::address_of(_author));
+        let PublishCapability {
+            paper_uid_hash,
+            paper_hash,
+            price,
+            expires_at
+        } = move_from<PublishCapability>(signer::address_of(author));
 
         assert!(price > 0, E_INVALID_PRICE);
-
-        // Capability expiration check
-        assert!(
-            timestamp::now_seconds() <= expires_at,
-            E_EXPIRED
-        );
+        assert!(timestamp::now_seconds() <= expires_at, E_EXPIRED);
+        assert!(vector::length(&authors) > 0, E_INVALID_RECIPIENT);
 
         let registry = borrow_global_mut<Registry>(@publish3);
-        let counter = borrow_global_mut<PaperCounter>(@publish3);
+
+        assert!(
+            !table::contains(&registry.papers, paper_uid_hash),
+            E_ALREADY_PUBLISHED
+        );
 
         let paper = Paper {
-            id: counter.next_id,
+            paper_uid_hash,
             authors,
             price,
             content_hash: paper_hash,
             published_at: timestamp::now_seconds()
         };
 
-        vector::push_back(&mut registry.papers, paper);
+        table::add(&mut registry.papers, paper_uid_hash, paper);
 
         event::emit(PaperPublished {
-            paper_id: counter.next_id,
+            paper_uid_hash,
             authors,
-            price: price
+            price
         });
-
-        counter.next_id += 1;
     }
 
     /*********************************
-     * Purchase (x402-compatible)
+     * Purchase
      *********************************/
 
     public entry fun purchase(
         buyer: &signer,
-        paper_id: u64,
-        amount: u64
+        paper_uid_hash: vector<u8>
     ) acquires Registry {
 
         let registry = borrow_global<Registry>(@publish3);
-        let paper_ref = vector::borrow(&registry.papers, paper_id);
 
-        assert!(amount >= paper_ref.price, E_INVALID_PRICE);
+        assert!(
+            table::contains(&registry.papers, paper_uid_hash),
+            E_NOT_FOUND
+        );
 
-        // Calculate royalty distribution
-        // Platform fee: 10% of purchase amount
+        let paper = table::borrow(&registry.papers, paper_uid_hash);
+
+        let author_count = vector::length(&paper.authors);
+        assert!(author_count > 0, E_INVALID_RECIPIENT);
+
+        let amount = paper.price;
+        let payment = coin::withdraw<AptosCoin>(buyer, amount);
+
         let platform_fee = (amount * PLATFORM_FEE_BPS) / 10000;
-        
-        // Author share: 90% of purchase amount  
         let author_share = amount - platform_fee;
-        
-        // Calculate per-author amount (equal split)
-        let author_count = vector::length(&paper_ref.authors);
-        let per_author_amount = if (author_count > 0) {
-            author_share / author_count
-        } else {
-            0
-        };
-        
-        // Handle remainder from division (give to platform)
-        let remainder = if (author_count > 0) {
-            author_share - (per_author_amount * author_count)
-        } else {
-            author_share
-        };
-        
+
+        let per_author_amount = author_share / author_count;
+        let remainder = author_share - (per_author_amount * author_count);
         let total_platform_fee = platform_fee + remainder;
 
-        // Emit royalty distribution event
-        event::emit(RoyaltyDistributed {
-            paper_id,
-            buyer: signer::address_of(buyer),
-            amount,
-            platform_fee: total_platform_fee,
-            author_share: author_share - remainder, // actual distributed to authors
-            per_author_amount
-        });
+        let platform_coin = coin::extract(&mut payment, total_platform_fee);
+        coin::deposit(@publish3, platform_coin);
 
-        // Emit x402 payment events (placeholders for actual x402 integration)
-        // Platform payment
-        event::emit(X402PaymentEvent {
-            recipient: @publish3, // Platform address
-            amount: total_platform_fee,
-            paper_id
-        });
-
-        // Author payments
         let i = 0;
         while (i < author_count) {
-            let author_address = *vector::borrow(&paper_ref.authors, i);
-            event::emit(X402PaymentEvent {
-                recipient: author_address,
-                amount: per_author_amount,
-                paper_id
-            });
+            let author = *vector::borrow(&paper.authors, i);
+            let share = coin::extract(&mut payment, per_author_amount);
+            coin::deposit(author, share);
             i = i + 1;
         };
 
-        // Also emit the original purchase event for compatibility
+        coin::destroy_zero(payment);
+
+        event::emit(RoyaltyDistributed {
+            paper_uid_hash,
+            buyer: signer::address_of(buyer),
+            amount,
+            platform_fee: total_platform_fee,
+            author_share: author_share - remainder,
+            per_author_amount
+        });
+
         event::emit(PaperPurchased {
-            paper_id,
+            paper_uid_hash,
             buyer: signer::address_of(buyer),
             amount
         });
-    }
-
-    /*********************************
-     * Helpers
-     *********************************/
-
-    fun hash_payload(payload: &MintPayload): vector<u8> {
-        hash::sha3_256(
-            bcs::to_bytes(payload)
-        )
     }
 }
